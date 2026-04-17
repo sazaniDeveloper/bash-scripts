@@ -1,0 +1,313 @@
+#!/bin/bash
+set -eo pipefail
+
+iface=${1:-enp0s8}
+http_url="http://127.0.0.1/"
+cpu_high_threshold=80
+cpu_caution_threshold=70
+softirq_high_threshold=80
+softirq_caution_threshold=70
+softirq_warning_threshold=50
+syn_ratio_high=3
+
+http_timeout=2.0
+report_date=$(date +"%d-%m-%Y")
+report_time=$(date +"%H-%M-%S")
+report_file="ddos-report-${report_date}-${report_time}.log"
+
+while [[ $# -gt 0 ]]; do
+     case $1 in 
+	     --iface)
+	     [ -z "$2" ] && { echo "Missing value for --iface"; exit 1; }
+	     iface=$2
+             if ! ip link show "$iface" > /dev/null 2>&1; then
+		echo "Error: Interface '$iface' does not exist"
+		exit 1
+	     fi
+	     shift 2
+	     ;;
+             --help) 
+             echo "Usage: ddos-diag"
+             echo "Host-based DDoS diagnostic tool"
+             exit 0
+	     ;;
+	     *)
+	     echo "Unknown option: $1"
+	     exit 1
+	     ;;
+     esac
+done
+
+if [[ $EUID -ne 0 ]]; then
+   echo "Run this script as root"
+   exit 1
+fi
+
+command -v vmstat ss netstat nstat curl bc tee >/dev/null || {
+	echo "Missing requiring command"
+        exit 1
+}
+
+mkdir -p /var/log/ddos_reports/
+#exec 3>&1 4>&2
+#exec > >(tee "/var/log/ddos_reports/$report_file" ) 2>&1
+{
+
+echo
+echo "=============================="
+echo "DDoS Diagnosis Report"
+echo "Generated: ${report_time} ${report_date}"
+echo "=============================="
+echo
+
+
+check_vmstat=$(vmstat 1 2 -S M)
+
+echo "============================================================================="
+echo -e 'System Health'
+echo "============================================================================="
+echo
+printf '%s\n' "$check_vmstat" | awk 'NR == 4 {printf "CPU Usage: %.2f%\n" \
+"I/O Wait: %d%\n" \
+"Runnable Processes: %d\n" \
+"Blocked Processes: %d\n" \
+"Free Memory: %.2f GB\n" \
+"Swap In: %.2f\n" \
+"Swap Out: %.2f\n" \
+"Block I/O in: %d\n" \
+"Block I/O out: %d\n",
+100-$15, $16, $1, $2, $4/1024, $7,$8, $9, $10}'
+
+before=$(awk '/NET_RX:/ {for (i=2; i<=NF; i++) sum+=$i} END {print sum}' /proc/softirqs)
+sleep 1
+after=$(awk '/NET_RX:/ {for (i=2; i<=NF; i++) sum+=$i} END {print sum}' /proc/softirqs)
+net_rx_rate=$((after-before))
+printf "NET_RX Softirqs/sec: %d\n" "$net_rx_rate"
+
+
+before_tx=$(awk '/NET_TX:/ {for (i=2; i<=NF; i++) sum+=$i} END {print sum}' /proc/softirqs)
+sleep 1
+after_tx=$(awk '/NET_TX:/ {for (i=2; i<=NF; i++) sum+=$i} END {print sum}' /proc/softirqs)
+net_tx_rate=$((after_tx-before_tx))
+printf "NET_TX Softirqs/sec: %d\n" "$net_tx_rate"
+
+si_perct=$(top -bn 1 | awk -F',' '/Cpu\(s\)/ {for (i=1; i<=NF; i++) if ($i ~ /si/) {gsub(/[^0-9.]/,"",$i); print $i}}')
+printf "CPU SoftIRQ: %.2f%%\n" $si_perct
+
+echo -e "\n" 
+echo "============================================================================="
+echo 'Network Diagnosis'
+echo "============================================================================="
+
+if [[ ! -d /sys/class/net/${iface} ]]; then
+   echo "Interface $iface does not exist"
+   exit 1
+fi
+
+syn_recv=$(ss -4napt state syn-recv | awk 'NR > 1 {print $4}' | cut -d':' -f1) || syn_recv=""
+nr_syn=$(printf "%s\n" "$syn_recv" | wc -w)
+
+prev_nr_syn=$(printf "%s\n" "$syn_recv" | wc -w)
+prev_listen_drops=$(netstat -s | awk '/SYNs to LISTEN sockets dropped/ {print $1}') || listen_drops=0
+prev_rx_packets=$(cat /sys/class/net/${iface}/statistics/rx_packets)
+prev_rx_bytes=$(cat /sys/class/net/${iface}/statistics/rx_bytes)
+prev_tx_packets=$(cat /sys/class/net/${iface}/statistics/tx_packets)
+prev_rx_drops=$(cat /sys/class/net/${iface}/statistics/rx_dropped)
+prev_rx_errors=$(cat /sys/class/net/${iface}/statistics/rx_errors)
+prev_tx_bytes=$(cat /sys/class/net/${iface}/statistics/tx_bytes)
+
+sleep 1
+
+curr_nr_syn=$(printf "%s\n" "$syn_recv" | wc -w)
+curr_listen_drops=$(netstat -s | awk '/SYNs to LISTEN sockets dropped/ {print $1}') || listen_drops=0
+curr_rx_packets=$(cat /sys/class/net/${iface}/statistics/rx_packets)
+curr_rx_bytes=$(cat /sys/class/net/${iface}/statistics/rx_bytes)
+curr_tx_packets=$(cat /sys/class/net/${iface}/statistics/tx_packets)
+curr_rx_drops=$(cat /sys/class/net/${iface}/statistics/rx_dropped)
+curr_rx_errors=$(cat /sys/class/net/${iface}/statistics/rx_errors)
+curr_tx_bytes=$(cat /sys/class/net/${iface}/statistics/tx_bytes)
+
+delta_nr_syn=$((curr_nr_syn - prev_nr_syn))
+delta_listen_drops=$((curr_listen_drops - prev_listen_drops))
+delta_rx=$((curr_rx_packets - prev_rx_packets))
+delta_rx_bytes=$((curr_rx_bytes - prev_rx_bytes))
+delta_tx=$((curr_tx_packets - prev_tx_packets))
+delta_drops=$((curr_rx_drops - prev_rx_drops))
+delta_errors=$((curr_rx_errors - prev_rx_errors))
+delta_tx_bytes=$((curr_tx_bytes - prev_tx_bytes))
+
+echo "RX Packets/sec: $delta_rx" 
+echo "RX Dropped/sec: $delta_drops"
+echo "RX Bytes/sec: $delta_rx_bytes"
+echo "TX Bytes/sec: $delta_tx_bytes"
+echo "RX Errors/sec: $delta_errors"
+echo "TX Packets/sec: $delta_tx"
+
+established=$(ss -4tn state established | awk 'NR > 1 {print $4}' | cut -d':' -f1) || established=""
+listen_drops=${listen_drops:-0}
+
+top20(){
+  sort | uniq -c | sort -rn | head -20
+}
+echo
+echo
+echo
+echo "SYN Block"
+echo '-----------------------------------------------------------------------------'
+
+if [[ $nr_syn -eq 0 ]]; then 
+   printf "No SYN-RECV source IPs\n"
+else
+   echo "Top SYN-RECV source IPs:"
+   printf "%s\n" "$syn_recv" | top20
+   echo "Total SYN-RECV connections: $nr_syn"
+   echo "SYN_RECV Change (1s): $delta_nr_syn"
+fi
+
+printf "Dropped SYNs: %s\n" "${listen_drops:-0}"
+printf "Dropped SYNs Change: %s\n" "${delta_listen_drops}"
+
+echo
+echo
+echo
+echo "ESTABLISHED Block"
+echo '-----------------------------------------------------------------------------'
+
+est_nr=$(printf "%s\n" "$established" | wc -w)
+if [[ $est_nr -eq 0 ]]; then
+   printf "No ESTABLISHED connections\n"
+else
+   echo "Top ESTABLISHED connections:"
+   printf "%s\n" "$established" | top20
+   echo "Total ESTABLISHED connections: $est_nr"
+fi
+echo
+echo
+echo
+echo "UDP Block"
+echo '-----------------------------------------------------------------------------'
+
+
+udp_in=$(nstat -az | awk '/UdpInDatagrams/ {print $2+0}')
+udp_err=$(nstat -az | awk '/UdpInErrors/ {print $2+0}')
+icmp_unreach=$(nstat -az | awk '/IcmpOutDestUnreachs/ {print $2+0}')
+
+prv_error=$(nstat -az  | awk '/UdpRcvbufErrors/ {print $2+0}')
+prv_snd=$(nstat -az | awk '/UdpSndbufErrors/ {print $2+0}')
+
+sleep 1
+
+crr_error=$(nstat -az | awk '/UdpRcvbufErrors/ {print $2+0}')
+crr_snd=$(nstat -az | awk '/UdpSndbufErrors/ {print $2+0}')
+
+delta=$((crr_error - prv_error))
+snd_delta=$((crr_snd - prv_snd))
+
+echo "UDP in Datagrams (total): $udp_in"
+echo "UDP Errors (total): $udp_err"
+echo "ICMP Dest Unreachable (total): $icmp_unreach"
+echo "RcvBufErrors/sec: $delta"
+echo "SndBufErrors/sec: $snd_delta"
+echo
+echo
+echo
+echo -e 'HTTP Health Check'
+echo '-----------------------------------------------------------------------------'
+http_result=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' --max-time 3 "$http_url")
+http_code=$(echo "$http_result" | awk '{print $1}')
+http_time=$(echo "$http_result" | awk '{print $2}')
+echo "HTTP Code: $http_code"
+echo "HTTP Response Time (sec): ${http_time}s"
+
+if [ -z "$http_code" ] || [ "$http_code" = "000" ]; then
+   echo "HTTP Health: FAILED"
+elif (( $(echo "$http_time > $http_timeout" | bc -l) )); then
+   echo "HTTP Health: SLOW (${http_code}, ${http_time}s)"
+else
+   echo "HTTP Health: OK (${http_code}, ${http_time}s)" 
+fi
+echo
+echo
+echo
+echo "============================================================================="
+echo -e 'CONCLUSION'
+echo "============================================================================="
+echo
+
+cpu_usage=$(vmstat 1 2 | awk 'NR == 4 {print 100-$15}')
+
+if (( $(echo "$cpu_usage > $cpu_high_threshold" | bc -l) )); then
+   echo "CPU USAGE: HIGH" 
+elif (( $(echo "$cpu_usage > $cpu_caution_threshold" | bc -l ))); then
+   echo "CPU USAGE: SUSPICIOUS"
+else 
+   echo "CPU Usage: Normal"	
+fi
+
+echo
+
+if (( $(echo "$si_perct > $softirq_high_threshold" | bc -l) )); then
+   echo "CPU Softirq: HIGH"
+elif (( $(echo "$si_perct > $softirq_caution_threshold" | bc -l) )); then
+   echo "CPU Softirq: SUSPICIOUS"
+else
+   echo "CPU Softirq: Normal"
+fi
+
+echo
+
+if [ "$listen_drops" -gt 0 ]; then
+   echo "Dropped SYNs detected: service degradation likely"
+else
+   echo "No dropped SYNs detected"	
+fi
+
+echo
+
+est_safe=$est_nr
+if [ "$est_safe" -eq 0 ]; then
+   est_safe=1
+fi
+
+syn_ratio=$(( nr_syn / est_safe ))
+
+if [ "$syn_ratio" -gt "$syn_ratio_high" ]; then
+   echo "SYN/EST ratio: HIGH"
+else
+   echo "SYN/EST ratio: NORMAL"
+fi
+
+echo
+
+if [ -z "$http_code" ] || [ "$http_code" = "000" ]; then
+   echo "VERDICT: CRITICAL - service unavailable"
+   echo
+   echo "IMPACT LEVEL: DEGRADED"
+   exit 2
+elif (( $(echo "$http_time > $http_timeout" | bc -l) )); then
+   echo "VERDICT: WARNING - service degraded (slow HTTP response)"
+   echo
+   echo "IMPACT LEVEL: DEGRADED"
+   exit 1
+elif [ "$listen_drops" -gt 0 ] && (( $(echo "$si_perct > $softirq_high_threshold" | bc -l) )); then
+   echo "VERDICT: CRITICAL - likely SYN flood causing service degradation"
+   echo
+   echo "IMPACT LEVEL: UNDER ATTACK"
+   exit 2
+elif [ "$syn_ratio" -gt "$syn_ratio_high" ] && (( $(echo "$si_perct > $softirq_caution_threshold" | bc -l) )); then
+   echo "VERDICT: WARNING - likely SYN flood"
+   echo
+   echo "IMPACT LEVEL: UNDER ATTACK"
+   exit 1
+elif (( $(echo "$cpu_usage > $cpu_caution_threshold" | bc -l) )) && (( $(echo "$si_perct > $softirq_warning_threshold" | bc -l) )); then
+   echo "VERDICT: WARNING - abnormal network-driven CPU LOAD"
+   echo
+   echo "IMPACT LEVEL: SUSPICIOUS"
+   exit 1
+else
+   echo "VERDICT: No Strong SYN Flood indicators detected"
+   echo
+   echo "IMPACT LEVEL: NORMAL"
+   exit 0
+fi
+} | tee "/var/log/ddos_reports/$report_file" 
