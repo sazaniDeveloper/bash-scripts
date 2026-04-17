@@ -1,0 +1,484 @@
+#!/bin/bash
+set -euo pipefail
+if [[ $EUID -ne 0 ]]; then
+   echo "Run this script as root."
+   exit 1
+fi
+
+echo "#######################################"
+echo "##     DoS/DDoS Mitigation Script    ##"
+echo "#######################################"
+echo
+echo
+echo
+
+   function action_log(){
+    local action="$1"
+    local target="$2"
+    local result="$3" 
+
+    local dt 
+    dt=$(date +"%Y-%m-%d %H:%M:%S")
+    
+    
+    echo "[$dt] action: $action target=$target result=$result" >> /var/log/ddos-mitigation.log
+    
+   }
+
+   verify_nftables_layout(){
+    nft list table netdev earlydrop >/dev/null 2>&1 || {
+        echo "Error: table netdev earlydrop does not exist"
+        return 1
+     }
+    nft list set netdev earlydrop blacklist >/dev/null 2>&1 || {
+	echo "Error: blacklist set does not exist in netdev earlydrop"
+        return 1
+    }
+    nft list set netdev earlydrop blacklist_subnets >/dev/null 2>&1 || {
+        echo "Error: blacklist_subnets set does not exist in netdev earlydrop"
+        return 1
+    }
+    nft list chain netdev earlydrop ingress >/dev/null 2>&1 || {
+        echo "Error: ingress chain does not exist in netdev earlydrop"
+        return 1
+    }
+    nft list table inet filter >/dev/null 2>&1 || {
+        echo "Error: table inet filter does not exist"
+        return 1
+    }
+    nft list set inet filter syn_flood >/dev/null 2>&1 || {
+        echo "Error: syn_flood does not exist in inet filter"
+        return 1
+    }
+    nft list set inet filter web_flood >/dev/null 2>&1 || {
+        echo "Error: web_flood does not exist in inet filter"
+        return 1
+    }
+    nft list chain inet filter input >/dev/null 2>&1 || {
+        echo "Error: input chain does not exist in inet filter"
+        return 1
+    }
+   }
+
+
+   set_web_rate_atomic() {
+    local rate="$1"
+    local tmp_file
+    local handle
+    
+    handle=$(nft -a list chain inet filter input | awk '/@web_flood/ {for (i=1; i<=NF; i++) if ($i == "handle") {print $(i+1); exit }}')
+
+    if [ -z "$handle" ]; then
+       echo "Web rate-limit rate not found in inet filter input"
+       return 1
+    fi
+
+
+    tmp_file=$(mktemp /tmp/ddos-web-rate.XXXXXX.nft) || {
+        echo "Failed to create temp file"
+        return 1
+    }
+
+    {
+	printf "delete rule inet filter input handle %s\n" "$handle"
+	printf "add rule inet filter input tcp dport { 80, 443 } ct state new update @web_flood { ip saddr limit rate over %s/minute burst 5 packets } counter drop\n" $rate
+    } > "$tmp_file"
+
+    if ! nft -c -f "$tmp_file" >/dev/null 2>&1; then
+        echo "Generated nftables rules failed syntax check\n"
+        cat "$tmp_file"
+	rm -f "$tmp_file"
+        return 1
+    fi
+
+    if ! nft -f "$tmp_file"; then
+       echo "Failed to apply web rate rules\n"
+       cat "$tmp_file"
+       rm -f "$tmp_file"
+       return 1
+    fi
+
+    rm -f "$tmp_file"
+    return 0
+}
+
+
+
+   backup_ruleset(){
+     mkdir -p /var/backups
+     nft list ruleset > /var/backups/nftables.last || {
+       echo "Failed to create backup ruleset"
+       return 1
+     }
+   }
+
+   restore_ruleset(){
+     if [[ ! -f /var/backups/nftables.last ]]; then
+	echo "No backup ruleset found."
+	return 1
+     fi
+
+     nft -c -f /var/backups/nftables.last || {
+        echo "Backup ruleset failed syntax check"
+        return 1
+     }
+
+     nft flush ruleset || {
+        echo "Failed to flush current ruleset"
+        return 1
+     }
+     
+     nft -f /var/backups/nftables.last || {
+	echo "Failed to restore ruleset"
+        return 1
+     }
+   }
+   valid_ip4() {
+     local ip="$1"
+     [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { return 1; }
+     for i in ${ip//./ }; do
+        [[ "${#i}" -gt 1 && "${i:0:1}" == 0 ]] && { return 1; }
+        [[ "$i" -gt 255 ]] && { return 1; } 
+     done
+     return 0 
+   }
+ 
+   function blacklist_IP(){
+     local ip_address
+     echo -n "Enter the IP address: "
+     read -r ip_address
+     if ! valid_ip4 "$ip_address"; then
+       echo "IP Address is invalid!"
+       return 1
+     fi
+       echo
+       
+       if ! nft list set netdev earlydrop blacklist >/dev/null 2>&1; then
+	  echo "Error: blacklist set does not exist"
+	  return 1
+       fi	 
+       
+       if nft list set netdev earlydrop blacklist | grep -qw "$ip_address"; then
+	  echo "IP already blacklisted"
+	  return 1
+       fi
+       
+       verify_nftables_layout
+       backup_ruleset || return 1
+
+       if nft add element netdev earlydrop blacklist "{ $ip_address timeout 1h }"; then
+	  echo "$ip_address blacklisted"
+          action_log "BLACKLIST_IP" "$ip_address" "SUCCESS"
+       else
+          echo "Failed to blacklist $ip_address"	       
+          action_log "BLACKLIST_IP" "$ip_address" "FAIL"
+	  return 1
+       fi
+       printf "\n\n\n"
+   }
+
+   function unblock_IP(){ 
+     local ip_address 
+     echo -n "Enter the IP address: "
+     read -r ip_address
+     
+     if ! valid_ip4 "$ip_address"; then
+       echo "IP Address is invalid!"
+       return 1
+     fi
+       echo
+
+       if ! nft list set netdev earlydrop blacklist>/dev/null 2>&1; then
+	  echo "Error: blacklist set does not exist"
+	  return 1
+       fi	 
+       
+       if ! nft list set netdev earlydrop blacklist | grep -qw "$ip_address"; then
+	  echo "IP Address does not exist"
+	  return 1
+       fi
+
+       verify_nftables_layout
+       backup_ruleset || return 1
+       
+       if nft delete element netdev earlydrop blacklist "{ $ip_address }"; then
+          echo "$ip_address has been removed from blacklist"
+          action_log "UNBLOCK_IP" "$ip_address" "SUCCESS"
+       else
+          echo "Failed to unblock $ip_address"	
+          action_log "UNBLOCK_IP" "$ip_address" "FAIL"
+          return 1	  
+       fi       
+       printf "\n\n\n"
+   }
+   
+   function blacklist_subnet(){
+     echo -n "Enter the subnet: "
+     read -r cidr
+     [[ "$cidr" == */* ]] || {
+      echo "Invalid subnet format. Use x.x.x.x/yy"
+      return 1
+     }
+     local ip4_address="${cidr%%/*}"
+     local subnet="${cidr##*/}"
+     if ! valid_ip4 "$ip4_address"; then
+       echo "IP Address is invalid!"
+       return 1
+     fi
+
+     if ! nft list set netdev earlydrop blacklist_subnets >/dev/null 2>&1; then
+	  echo "Error: blacklist_subnets set does not exist"
+	  return 1
+     fi
+     
+     if [[ "$subnet" =~ ^[0-9]+$ ]] && (( subnet >=0 && subnet <= 32 )); then
+        :
+     else
+          echo "CIDR prefix must be between 0 and 32."
+	  return 1
+     fi
+
+     if nft list set netdev earlydrop blacklist_subnets | grep -qw "$cidr"; then
+	  echo "CIDR already blacklisted"
+	  return 1
+     fi
+
+     verify_nftables_layout
+     backup_ruleset || return 1
+
+     if nft add element netdev earlydrop blacklist_subnets "{ $cidr }"; then
+        echo "$cidr blacklisted"
+        action_log "BLACKLIST_SUBNET" "$cidr" "SUCCESS"
+     else
+	echo "Failed to blacklist $cidr"
+        action_log "BLACKLIST_SUBNET" "$cidr" "FAIL"
+        return 1	
+     fi     
+     printf "\n\n\n"
+   }
+
+   function unblock_subnet(){
+
+     echo -n "Enter the subnet: "
+     read -r cidr
+     [[ "$cidr" == */* ]] || {
+      echo "Invalid subnet format. Use x.x.x.x/yy"
+      return 1
+     }
+     local ip4_address="${cidr%%/*}"
+     local subnet="${cidr##*/}"
+     if ! valid_ip4 "$ip4_address"; then
+       echo "IP Address is invalid!"
+       return 1
+     fi
+
+     if ! nft list set netdev earlydrop blacklist_subnets >/dev/null 2>&1; then
+	  echo "Error: blacklist_subnets set does not exist"
+	  return 1
+     fi
+     
+     if [[ "$subnet" =~ ^[0-9]+$ ]] && (( subnet >=0 && subnet <= 32 )); then
+        :
+     else
+          echo "CIDR prefix must be between 0 and 32"
+	  return 1
+     fi
+
+     if ! nft list set netdev earlydrop blacklist_subnets | grep -qw "$cidr"; then
+	  echo "CIDR does not exist"
+	  return 1
+     fi
+
+     verify_nftables_layout
+     backup_ruleset || return 1
+
+     if nft delete element netdev earlydrop blacklist_subnets "{ $cidr }"; then
+	  echo "CIDR has been unblocked"
+          action_log "UNBLOCK_SUBNET" "$cidr" "SUCCESS"
+     else
+	  echo "Failed to unblock $cidr"
+          action_log "UNBLOCK_SUBNET" "$cidr" "FAIL"
+	  return 1
+     fi
+     printf "\n\n\n"
+   } 
+   
+   limit_rate() {
+    local rate
+
+    echo -e "How much would you like to limit the rate?\n"
+    echo -e "1) 10 connections/minute"
+    echo -e "2) 50 connections/minute"
+    echo -e "3) 100 connections/minute"
+    printf "\n\n"
+    read -r rate
+
+    case "$rate" in
+        1) rate="10" ;;
+        2) rate="50" ;;
+        3) rate="100" ;;
+        *)
+            echo "Invalid option"
+            return 1
+            ;;
+    esac
+
+    verify_nftables_layout || return 1
+    backup_ruleset || return 1
+
+    if set_web_rate_atomic "$rate"; then
+        echo "Connection rate limited to ${rate}/minute"
+        action_log "SET_RATE_LIMIT" "${rate}/minute" "SUCCESS"
+    else
+        echo "Failed to set connection rate limit"
+        action_log "SET_RATE_LIMIT" "${rate}/minute" "FAIL"
+        return 1
+    fi
+
+    printf "\n\n\n"
+   }   
+
+   function rollback() { 
+     echo "Are you sure you want to rollback? (Y/N)"
+     read -r answer 
+     case $answer in 
+	 y|Y)
+	 echo "Rolling back!"
+
+	 nft -c -f /etc/nftables.conf || {
+            echo "Baseline nftables.conf failed syntax check"
+	    action_log "ROLLBACK_NORMAL" "/etc/nftables.conf" "FAIL"
+	    return 1
+         }
+
+	 nft flush ruleset || {
+            echo "Failed to flush current ruleset"
+	    action_log "ROLLBACK_NORMAL" "/etc/nftables.conf" "FAIL"
+	    return 1
+         }
+	 nft -f /etc/nftables.conf || {
+            echo "Failed to restore normal ruleset"
+	    action_log "ROLLBACK_NORMAL" "/etc/nftables.conf" "FAIL"
+	    return 1
+	 }
+
+         action_log "ROLLBACK_NORMAL" "/etc/nftables.conf" "SUCCESS"
+	 printf "\n\n\n"
+	 return 0
+	 ;;
+         n|N)
+	 echo "Canceled!"
+         action_log "ROLLBACK_NORMAL" "/etc/nftables.conf" "CANCELLED"
+         printf "\n\n\n"
+	 return 0
+         ;; 
+         *)
+         echo "Invalid input. Please choose an option."
+         return 1
+         ;;
+ 
+     esac
+   }
+
+   function status_view(){
+     local blocked_ip_addresses
+     local blocked_subnets
+     local connection_rate
+     local syn_tracked
+     local web_tracked
+     local syn_rate
+     local web_rate
+
+     if ! nft list set netdev earlydrop blacklist >/dev/null 2>&1; then
+	  echo "Error: blacklist set does not exist"
+	  return 1
+     fi	
+
+
+     if ! nft list set netdev earlydrop blacklist_subnets >/dev/null 2>&1; then
+	  echo "Error: blacklist_subnets set does not exist"
+	  return 1
+     fi
+
+     if ! nft list chain inet filter input >/dev/null 2>&1; then
+	  echo "Error: inet filter input does not exist"
+	  return 1
+     fi
+
+     blocked_ip_addresses=$(nft list set netdev earlydrop blacklist | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' || true)
+     blocked_subnets=$(nft list set netdev earlydrop blacklist_subnets | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}/(3[0-2]|[12]?[0-9])' || true)
+     
+     syn_tracked=$(nft list set inet filter syn_flood | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' || true)
+     web_tracked=$(nft list set inet filter web_flood | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' || true)
+     
+     syn_rate=$(nft list chain inet filter input | grep "@syn_flood" | grep -Eo "[0-9]+/(second|minute)" || true)
+     web_rate=$(nft list chain inet filter input | grep "@web_flood" | grep -Eo "[0-9]+/(second|minute)" || true)
+     echo -e "\nManual Blacklist"
+     echo "--------------------------------------------------"
+     echo -e "IP Addresses: \n${blocked_ip_addresses:-None}\n"
+     echo -e "Subnets: \n${blocked_subnets:-None}\n\n"
+   
+     echo -e "Dynamic Tracking"
+     echo "--------------------------------------------------"
+     echo -e " SYN Flood IPs: ${syn_tracked:-None}"
+     echo -e " Web Flood IPs: ${web_tracked:-None}\n\n"
+
+     echo -e "Rate Limits: " 
+     echo -e " SYN Rate: ${syn_rate:-None}"
+     echo -e " Web Rate: ${web_rate:-None}"
+     printf "\n\n\n"
+   }
+
+while true
+do
+   echo "What would you like to do?"
+   echo "1) Blacklist IP Address"   
+   echo "2) Blacklist subnet"
+   echo "3) Limit Rate"
+   echo "4) Rollback"
+   echo "5) Status View"
+   echo "6) Unblock IP Address"
+   echo "7) Unblock subnet"
+   echo "8) Exit"
+   printf "\n\n\n"
+   read -r option 
+   
+   case $option in 
+        1)
+	blacklist_IP
+        ;;
+   
+        2)
+	blacklist_subnet
+        ;;
+   
+        3)
+	limit_rate
+        ;;		
+   
+        4)
+        rollback	
+	;;  
+
+        5)
+        status_view	
+	;;
+
+        6)
+        unblock_IP
+	;;
+
+        7)
+        unblock_subnet
+	;;
+
+        8)
+        echo "Exiting the program! Bye!"
+        break
+	;;  
+       
+        *)
+        echo "Invalid input. Please choose an option."
+        ;;
+   esac
+done
